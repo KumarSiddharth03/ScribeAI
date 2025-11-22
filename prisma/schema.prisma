@@ -28,8 +28,8 @@ model User {
 model Account {
   id                   String   @id @default(cuid())
   userId               String
-  accountId            String   // replaces providerAccountId
-  providerId           String   // replaces provider
+  accountId            String   
+  providerId           String   
   accessToken          String?
   refreshToken         String?
   idToken              String?
