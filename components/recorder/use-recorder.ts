@@ -497,14 +497,9 @@ export function useRecorder() {
           preferCurrentTab: true,
         } as DisplayMediaStreamOptions);
         tabStreamRef.current = tabStream;
+        let usedMicFallbackOnly = false;
 
-        if (!tabStream.getAudioTracks().length) {
-          tabStream.getTracks().forEach((track) => track.stop());
-          throw new Error(
-            "The shared tab/window did not include audio. When sharing a tab, be sure to enable 'Share tab audio'."
-          );
-        }
-
+        const tabHasAudio = tabStream.getAudioTracks().length > 0;
         const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
         micStreamRef.current = micStream;
         if (!micStream.getAudioTracks().length) {
@@ -513,16 +508,23 @@ export function useRecorder() {
           throw new Error("Microphone access is required when recording a tab. Please enable mic permissions and try again.");
         }
 
-        const audioContext = new AudioContext();
-        const destination = audioContext.createMediaStreamDestination();
-        audioContext.createMediaStreamSource(tabStream).connect(destination);
-        audioContext.createMediaStreamSource(micStream).connect(destination);
-        audioContextRef.current = audioContext;
-        combinedDestinationRef.current = destination;
+        if (!tabHasAudio) {
+          usedMicFallbackOnly = true;
+          stream = micStream;
+          log("Tab capture did not include audio; recording microphone only.");
+        } else {
+          const audioContext = new AudioContext();
+          const destination = audioContext.createMediaStreamDestination();
+          audioContext.createMediaStreamSource(tabStream).connect(destination);
+          audioContext.createMediaStreamSource(micStream).connect(destination);
+          audioContextRef.current = audioContext;
+          combinedDestinationRef.current = destination;
 
-        const combinedStream = new MediaStream();
-        destination.stream.getAudioTracks().forEach((track) => combinedStream.addTrack(track));
-        stream = combinedStream;
+          const combinedStream = new MediaStream();
+          destination.stream.getAudioTracks().forEach((track) => combinedStream.addTrack(track));
+          stream = combinedStream;
+        }
+
         const tabVideoTrack = tabStream.getVideoTracks()[0] ?? null;
         if (tabVideoTrack) {
           tabVideoTrackRef.current = tabVideoTrack;
@@ -537,11 +539,19 @@ export function useRecorder() {
             removeTabEndedHandlerRef.current = null;
           };
         }
-        trackTargets.push(
-          { stream: combinedStream, label: "tab-mix", endBehavior: "recover" },
-          { stream: tabStream, label: "tab-share", endBehavior: "stop" },
-          { stream: micStream, label: "tab-mic", endBehavior: "recover" }
-        );
+
+        if (usedMicFallbackOnly) {
+          trackTargets.push(
+            { stream: micStream, label: "tab-mic-fallback", endBehavior: "recover" },
+            { stream: tabStream, label: "tab-share", endBehavior: "stop" }
+          );
+        } else {
+          trackTargets.push(
+            { stream, label: "tab-mix", endBehavior: "recover" },
+            { stream: tabStream, label: "tab-share", endBehavior: "stop" },
+            { stream: micStream, label: "tab-mic", endBehavior: "recover" }
+          );
+        }
       }
 
       if (!stream.getAudioTracks().length) {
