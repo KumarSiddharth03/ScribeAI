@@ -1,36 +1,333 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ScribeAI
 
-## Getting Started
+> ScribeAI captures mic/tab audio, streams diarized chunks to Gemini, and persists transcripts + summaries in Postgres with export-ready archives.
 
-First, run the development server:
+## Table of contents
+
+1. [Product overview](#product-overview)
+2. [Objectives & feature map](#objectives--feature-map)
+3. [Tech stack](#tech-stack)
+4. [Quick start](#quick-start)
+5. [Environment variables](#environment-variables)
+6. [Developer scripts](#developer-scripts)
+7. [Domain models](#domain-models)
+8. [Full architecture diagram](#full-architecture-diagram)
+9. [Streaming pipeline](#streaming-pipeline)
+10. [WebRTC vs. MediaRecorder](#webrtc-vs-mediarecorder)
+11. [Long-session scalability](#long-session-scalability)
+12. [Media handling analysis](#media-handling-analysis)
+13. [Media handling deep dive](#media-handling-deep-dive)
+14. [API overview](#api-overview)
+15. [Security model](#security-model)
+16. [Loom walkthrough](#loom-walkthrough)
+
+## Product overview
+
+ScribeAI is a real-time meeting companion that eliminates manual note-taking. It:
+
+- Records microphone audio or captures tab audio (Google Meet/Zoom) with MediaRecorder.
+- Streams 30-second chunks through a Socket.io relay that survives flaky networks.
+- Transcribes every chunk with Gemini 1.5 (Flash/Pro) using diarization-focused prompts.
+- Persists raw audio, transcripts, and summaries in Postgres via Prisma.
+- Generates structured summaries at stop time.
+
+The system is hardened for 1-hour meetings, laptop sleep/wake cycles, unstable connectivity, and tab audio interruptions.
+
+## Objectives & feature map
+
+- **Recorder UI** – The `RecorderPanel` mounts `useRecorder`, which creates a `RecordingSession` via `POST /api/recordings` and spins up a MediaRecorder with 30s chunks.
+- **Chunk uploader** – Each chunk is base64-encoded and emitted over Socket.io (`audio-chunk`) for sub-second processing; if the relay is offline the hook falls back to `POST /api/recordings/:id/chunks`.
+- **Completion** – Hitting stop flushes the queue through Socket.io first and then REST if needed, triggering Gemini summaries and status events.
+- **Session history** – The dashboard fetches recent sessions (with latest status events) and displays summaries plus timestamps. Socket.io streams `chunk-transcribed` events so UI badges update without polling.
+
+## Tech stack
+
+| Layer | Technology |
+| --- | --- |
+| **Frontend/UI** | Next.js 16 (App Router) + TypeScript + Tailwind |
+| **Auth** | Better Auth (email/password + Google OAuth) |
+| **Database** | Postgres + Prisma ORM |
+| **Realtime** | Socket.io (Node relay) with REST fallback |
+| **AI** | Gemini 1.5 Flash / Pro for transcription & summaries |
+| **Audio capture** | MediaRecorder, WebAudio API, `getDisplayMedia`/`getUserMedia` |
+
+## Quick start
 
 ```bash
+# 1. Install dependencies
+npm install
+
+# 2. Generate Prisma client & push schema
+npx prisma generate
+npx prisma migrate dev --name init
+
+# 3. Run the Next.js dev server (UI + REST fallback)
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+
+# 4. In a second terminal, start the Socket.io relay (required for live streaming)
+npm run dev:sockets
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Environment variables
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Create a `.env` in the project root:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```env
+DATABASE_URL="postgresql://user:password@localhost:5432/scribeai?schema=public"
+BETTER_AUTH_SECRET="generate-a-long-random-string"
+BETTER_AUTH_URL="http://localhost:3000" # optional when same origin
+NEXT_PUBLIC_APP_URL="http://localhost:3000"
+NEXT_PUBLIC_SOCKET_URL="http://localhost:4001" # optional once Socket.io gateway is running
+SOCKET_PORT="4001" # port used by npm run dev:sockets
+GOOGLE_CLIENT_ID="optional-google-client-id"
+GOOGLE_CLIENT_SECRET="optional-google-client-secret"
+GEMINI_API_KEY="your-ai-google-dev-key"
+GEMINI_MODEL="gemini-1.5-flash"
+```
 
-## Learn More
+## Developer scripts
 
-To learn more about Next.js, take a look at the following resources:
+| Command | Description |
+| --- | --- |
+| `npm run dev` | Launches Next.js (App Router) with Better Auth, recorder UI, and REST chunk ingestion routes. |
+| `npm run dev:sockets` | Starts the Socket.io relay defined in `server/sockets/index.ts` (currently optional; REST uploads work without it). |
+| `npx prisma studio` | Inspect and edit Postgres data locally. |
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Domain models
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- **RecordingSession** – A single meeting recording with a unique ID, start/end timestamps, and a queue of audio chunks.
+- **AudioChunk** – A 30-second audio segment with a unique ID, timestamp, and base64-encoded audio data.
+- **Transcript** – A text representation of the audio recording, generated by Gemini's speech-to-text API.
+- **Summary** – A condensed version of the transcript, generated by Gemini's summarization API.
 
-## Deploy on Vercel
+## Full architecture diagram
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```
+                                ┌───────────────────────────┐
+                                │         User UI           │
+                                │  - Start / Pause / Stop   │
+                                │  - Live transcript view   │
+                                │  - Error / status badges  │
+                                └──────────────┬────────────┘
+                                               │ React Hook
+                                               ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                               useRecorder()                              │
+│──────────────────────────────────────────────────────────────────────────│
+│   - MediaRecorder Orchestrator                                           │
+│   - Chunking (30s)                                                       │
+│   - Auto-Reconnect                                                       │
+│   - Queuing + Backpressure                                               │
+│   - Device-interruption Recovery                                         │
+│   - XState session management                                            │
+│──────────────────────────────────────────────────────────────────────────│
+│   Inputs:                                                                │
+│      • getUserMedia (mic)                                                │
+│      • getDisplayMedia (tab audio)                                       │
+│      • Audio mixing via WebAudioAPI                                      │
+│   Outputs:                                                               │
+│      • 30s PCM/Opus blobs                                                │
+│      • Base64 audio chunks                                               │
+│      • UI state updates                                                  │
+└───────────────────────────┬──────────────────────────────────────────────┘
+                            │
+                 Chunk Upload Pipeline
+                            ▼
+              ┌──────────────────────────────┐
+              │     Socket.io Client         │
+              │ - audio-chunk emit           │
+              │ - session-status events      │
+              │ - chunk-transcribed events   │
+              │ - reconnect on disconnect    │
+              └───────────────┬──────────────┘
+                              │ WebSocket
+                              ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │                    Socket.io Server                     │
+        │  - Validates session/token                              │
+        │  - Receives 30s chunks                                  │
+        │  - Emits live transcript updates                        │
+        │  - Manages joining/leaving recording rooms              │
+        └──────────────────────┬──────────────────────────────────┘
+                               │
+                               ▼
+      ┌──────────────────────────────────────────────────────────────┐
+      │                     Node.js Backend API                     │
+      │──────────────────────────────────────────────────────────────│
+      │ /api/recordings                                             │
+      │ /api/recordings/:id/chunks                                  │
+      │ /api/recordings/:id/complete                                │
+      │                                                              │
+      │ - Stores chunk metadata                                      │
+      │ - Validates recording sessions                               │
+      │ - When a chunk arrives                                      │
+      │       → forwards audio to Gemini                             │
+      │       → stores partial result                                │
+      │ - On complete:                                               │
+      │       → merge chunks                                         │
+      │       → produce final transcript + summary                   │
+      └───────────────────┬──────────────────────────────────────────┘
+                          │
+                          ▼
+                ┌──────────────────────────┐
+                │     Gemini Realtime      │
+                │  - Streaming transcription│
+                │  - Multi-speaker diariza. │
+                │  - Summaries / insights   │
+                └───────────────┬──────────┘
+                                │
+                                ▼
+      ┌────────────────────────────────────────────────────────────┐
+      │                     Database (Postgres)                    │
+      │────────────────────────────────────────────────────────────│
+      │ recordings                                                 │
+      │ chunks (30-second segments)                                │
+      │ partial_transcripts                                        │
+      │ final_transcripts                                          │
+      │ summaries                                                  │
+      └────────────────────────────────────────────────────────────┘
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+**Recap:**
+- Browser UI + `useRecorder` manage capture, buffering, and UX state.
+- Socket.io client/relay keep live transcripts flowing and auto-recover from drops (REST only kicks in when sockets are down).
+- Next.js API routes own auth, session bootstrap, and dashboard reads.
+- Gemini handles transcription + summaries; Postgres persists everything via Prisma.
+
+This architecture map shows how all tiers interact during a recording.
+
+## Streaming pipeline
+
+```mermaid
+flowchart LR
+    subgraph UI[Browser UI]
+        A[RecorderPanel + useRecorder]
+    end
+
+    subgraph CAP[Capture Layer]
+        A1[getUserMedia / getDisplayMedia\n(mic or tab)]
+        A2[MediaRecorder\n30s chunks]
+        A3[Queue + Backpressure]
+    end
+
+    subgraph WS[Socket.io Client]
+        S1[[emit: audio-chunk]]
+        S2[[on: chunk-transcribed]]
+        S3[[auto-reconnect\nfallback to REST]]
+    end
+
+    subgraph REST[Next.js API Routes]
+        B1[/POST /api/recordings]
+        B2[/POST /api/recordings/:id/chunks]
+        B3[/POST /api/recordings/:id/complete]
+    end
+
+    subgraph SOCKET_SERVER[Socket.io Relay (Node.js)]
+        R1[Validate token + rate-limit]
+        R2[Persist chunk → Prisma]
+        R3[Call transcribeChunk]
+        R4[emit: chunk-transcribed]
+    end
+
+    subgraph DB[(Postgres)]
+        D1[(recordingSession)]
+        D2[(audioChunk)]
+        D3[(transcript + summary)]
+    end
+
+    subgraph GEMINI[Gemini API]
+        G1[(Transcription)]
+        G2[(Summary)]
+    end
+
+    A --> A1 --> A2 --> A3
+    A3 -->|preferred| S1 --> SOCKET_SERVER
+    A3 -->|fallback| B2 --> DB
+
+    SOCKET_SERVER --> R3 --> G1
+    R3 --> R4 --> S2 --> A
+
+    A -->|create session| B1 --> DB
+    A -->|stop| B3 --> G2 --> DB
+
+    DB -->|UI updates| A
+```
+
+## WebRTC vs. MediaRecorder
+
+| Dimension | WebRTC uplink | MediaRecorder + Socket.io (current choice) |
+| --- | --- | --- |
+| **Latency** | RTP frames delivered in real time (<300ms) when SFU is close to Gemini. | 30s chunks mean transcripts land every 5–10 seconds on average, good enough for meeting notes. |
+| **Bandwidth** | Continuous stream (40–60 kbps voice) with congestion control managed by WebRTC. | Bursty uploads (≈0.5 MB every 30s). More tolerant of temporary drops because queue preserves order. |
+| **Server infra** | Requires SFU or MCU (e.g., LiveKit, Janus) + TURN. Need to multiplex streams for concurrent users. | Simple Node worker + Socket.io. Audio persisted chunk-by-chunk in Postgres—no SFU needed. |
+| **Browser support** | WebRTC well-supported but screen-share + mic combos often require custom permission UI. | MediaRecorder works in all Chromium browsers and Firefox; Safari support improving. Tab capture uses `getDisplayMedia`. |
+| **Scalability** | Needs SFU autoscaling, bandwidth billing, QoS tuning. Harder to run on hobby infra. | Scales horizontally with stateless Socket.io servers + Postgres. Chunks can be queued/replayed without SFU state. |
+| **Reliability** | If laptop sleeps, WebRTC session drops; must renegotiate SDP and may lose buffered audio. | Client-side queue + Prisma session state means resume is automatic, even after sleep/offline events. |
+
+**Concurrent-session takeaways:** with WebRTC every live meeting holds a long-lived peer connection plus DTLS/SRTP encryption state on the SFU, so 100 parallel meetings can exhaust CPU/RAM quickly unless you shard TURN/SFU fleets. Our MediaRecorder approach keeps each meeting as a stateless HTTP/WebSocket client that uploads blobs; Node workers can scale via simple horizontal replicas (or serverless functions) because no connection-specific media pipeline lives on the server. That architecture lets us serve many concurrent users without building a custom SFU layer while still meeting sub-minute transcription latency requirements.
+
+**Deeper trade-offs for this product:**
+
+- **Uplink/channel model** – MediaRecorder sends fire-and-forget chunks over HTTPS or Socket.io, so each session is just one client streaming blobs to Node. WebRTC would require ICE negotiation, TURN/SFU hosting (Janus/LiveKit), and ongoing NAT traversal for a capability we don’t need (bidirectional media).
+- **Scalability** – Chunk uploads are stateless HTTP/WebSocket payloads that any Node replica or serverless worker can ingest. WebRTC peers hold DTLS/SRTP pipelines, bandwidth adaptation state, and regular heartbeats on the SFU; scaling to hundreds of meetings means sharding SFUs and budgeting CPU for packet routing.
+- **Resilience** – Our queue retries on reconnect, buffers offline, and flushes only after the server acknowledges receipt. WebRTC transports typically drop when the laptop sleeps or switches networks, forcing renegotiation and risking lost audio unless you build a second buffering layer.
+- **Feature fit** – We only need reliable uploads for transcription/summaries, not multi-party playback. MediaRecorder keeps the stack simple and firewall-friendly. WebRTC would only become attractive if we later add live streaming to other viewers or analytics that truly need sub-second latency.
+
+**Conclusion:** For high-confidence transcription at scale, MediaRecorder + chunked uploads remain simpler, cheaper, and more resilient. If we ever need real-time multi-endpoint playback we can add a parallel WebRTC path, but there’s no reason to replace the current pipeline.
+
+## Long-session scalability
+
+ScribeAI is optimized for hour-long meetings where raw audio can exceed hundreds of megabytes. Instead of streaming audio continuously, the browser uses MediaRecorder to emit 30-second audio/webm chunks, keeping memory usage low (typically <20 MB). Each chunk is queued locally and uploaded through Socket.io when the network is available. If connectivity drops, the queue pauses, retries with exponential backoff, and resumes uploading once online, guaranteeing ordered delivery.
+
+On the backend, Node persists each chunk immediately into Postgres using Prisma. Because chunks are independent, the server can safely scale horizontally—any instance can process any incoming chunk. Gemini receives only the current chunk plus trimmed context (last ~2000 characters) to maintain speaker consistency without expensive full-history processing.
+
+When the user pauses, sleeps their laptop, or switches networks, the front end automatically restarts the capture pipeline and rebuilds the MediaRecorder without dropping previous data. At session completion, the system merges all chunk transcripts, generates a structured summary, and persists everything atomically.
+
+This approach ensures reliability, prevents memory leaks, and enables large-scale concurrency without SFUs or persistent WebRTC connections.
+
+## Media handling analysis
+
+| Concern | Implementation detail |
+| --- | --- |
+| **Tab + mic capture** | `getDisplayMedia` provides the meeting tab audio while `getUserMedia` grabs the local mic; both sources are mixed in an `AudioContext` so Gemini hears remote speakers and the narrator simultaneously. We also validate that tab audio is enabled, surfacing an actionable error if Chrome shares video-only. |
+| **Stream resilience** | Every `MediaStreamTrack` is monitored for `ended` and prolonged `mute` events. Mic/mix tracks trigger an auto-recovery path that re-runs `requestStream()` after laptop sleep, Bluetooth swaps, or permission changes, while shared-tab video tracks force an immediate `stopRecording()` so the UI enters Processing the moment the user clicks “Stop sharing.” |
+| **Queueing + flush** | MediaRecorder slices 30s blobs; a queue ref stores pending chunks, flushing when online and backing off otherwise. If uploads stall, the UI warns about backlog and offers “Retry”/“Discard” controls. |
+| **Socket vs REST** | Chunk uploads prefer Socket.io for low latency, falling back to REST if the relay isn’t available. Completion requests likewise try sockets first, then REST. |
+| **Gemini prompts** | Transcription prompt enforces diarized speaker turns, `[inaudible]` placeholders, and “no hallucinations.” Summary prompt demands three sections (Key points, Action items, Decisions) and ignores uncertain text, ensuring consistent output for session history. |
+
+Together these choices keep capture reliable (even across tab closes or device swaps) while preserving searchable transcripts and structured summaries.
+
+### Media handling deep dive
+
+| Media concern | Implementation |
+| --- | --- |
+| **Tab + mic mixing** | WebAudio graph (`AudioContext` → `MediaStreamDestination`) merges `getDisplayMedia` tab audio with `getUserMedia` mic input so Gemini hears both remote speakers and the narrator. |
+| **Device interruptions** | Every track registers `ended`, `mute`, and `unmute` listeners; the hook logs the culprit (e.g., `tab-share:video:0`) and routes it through auto-recovery. |
+| **Recovery** | `autoRecoverRef` re-runs `requestStream()` + `ensureMediaRecorder()` to rebuild the capture pipeline and resume uploads without losing session state. |
+| **Backpressure** | A local queue buffers 30-second blobs, `flushQueue()` uploads one at a time, and failures reinsert at the front so retries keep ordering intact. |
+| **Socket disconnects** | `uploadChunk` prefers Socket.io (acks + live transcripts); on disconnect it falls back to REST and later rejoins the socket room once connectivity returns. |
+| **Diarization quality** | Gemini prompt enforces speaker labels, `[inaudible]` placeholders, and “no hallucinations,” keeping diarized output consistent even across retries. |
+
+## API overview
+
+| Endpoint | Description |
+| --- | --- |
+| `POST /api/recordings` | Create a new recording session and return the socket token used to authenticate live chunk uploads. |
+| `POST /api/recordings/:id/chunks` | Upload a chunk via REST (used as fallback when Socket.io isn’t available). |
+| `POST /api/recordings/:id/complete` | Trigger Gemini summary generation and finalize the session. |
+| `GET /api/recordings` | Fetch the authenticated user’s recent session history. |
+
+## Security model
+
+- HMAC-signed socket tokens issued per session (no Better Auth secret shared with browsers).
+- Better Auth session validation on every API request.
+- Per-user row isolation in Prisma queries (recordings/chunks filtered by `userId`).
+- Chunk size limits + rate limiting (40 chunks per 10 seconds) enforced in the socket relay.
+- Gemini API key stays server-side; the browser never touches it.
+
+
+## Loom walkthrough
+
+Watch the [full video walkthrough](https://www.loom.com/share/3c939b056ed9495d9da6d9fc943f1fb9) for a demonstration of ScribeAI's features and functionality.
+
+Contributions and feedback are welcome!
