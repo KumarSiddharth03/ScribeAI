@@ -152,15 +152,15 @@ GEMINI_MODEL="gemini-1.5-flash"
                                │
                                ▼
       ┌──────────────────────────────────────────────────────────────┐
-      │                     Node.js Backend API                     │
+      │                     Node.js Backend API                      │
       │──────────────────────────────────────────────────────────────│
-      │ /api/recordings                                             │
-      │ /api/recordings/:id/chunks                                  │
-      │ /api/recordings/:id/complete                                │
+      │ /api/recordings                                              │
+      │ /api/recordings/:id/chunks                                   │
+      │ /api/recordings/:id/complete                                 │
       │                                                              │
       │ - Stores chunk metadata                                      │
       │ - Validates recording sessions                               │
-      │ - When a chunk arrives                                      │
+      │ - When a chunk arrives                                       │
       │       → forwards audio to Gemini                             │
       │       → stores partial result                                │
       │ - On complete:                                               │
@@ -266,7 +266,7 @@ flowchart LR
 | **Scalability** | Needs SFU autoscaling, bandwidth billing, QoS tuning. Harder to run on hobby infra. | Scales horizontally with stateless Socket.io servers + Postgres. Chunks can be queued/replayed without SFU state. |
 | **Reliability** | If laptop sleeps, WebRTC session drops; must renegotiate SDP and may lose buffered audio. | Client-side queue + Prisma session state means resume is automatic, even after sleep/offline events. |
 
-**Concurrent-session takeaways:** with WebRTC every live meeting holds a long-lived peer connection plus DTLS/SRTP encryption state on the SFU, so 100 parallel meetings can exhaust CPU/RAM quickly unless you shard TURN/SFU fleets. Our MediaRecorder approach keeps each meeting as a stateless HTTP/WebSocket client that uploads blobs; Node workers can scale via simple horizontal replicas (or serverless functions) because no connection-specific media pipeline lives on the server. That architecture lets us serve many concurrent users without building a custom SFU layer while still meeting sub-minute transcription latency requirements.
+**Concurrent-session takeaways:** With WebRTC every live meeting holds a long-lived peer connection plus DTLS/SRTP encryption state on the SFU, so 100 parallel meetings can exhaust CPU/RAM quickly unless you shard TURN/SFU fleets. Our MediaRecorder approach keeps each meeting as a stateless HTTP/WebSocket client that uploads blobs; Node workers can scale via simple horizontal replicas (or serverless functions) because no connection-specific media pipeline lives on the server. That architecture lets us serve many concurrent users without building a custom SFU layer while still meeting sub-minute transcription latency requirements.
 
 **Deeper trade-offs for this product:**
 
