@@ -76,6 +76,13 @@ export function useRecorder() {
   const trackCleanupRef = useRef<(() => void) | null>(null);
   const streamRestartPromiseRef = useRef<Promise<void> | null>(null);
   const autoRecoverRef = useRef<((reason: string) => void) | null>(null);
+  const isStoppingRef = useRef(false);
+  const tabStreamRef = useRef<MediaStream | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const combinedDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const tabVideoTrackRef = useRef<MediaStreamTrack | null>(null);
+  const removeTabEndedHandlerRef = useRef<(() => void) | null>(null);
 
   const postJson = useCallback(async <T,>(url: string, body?: Record<string, unknown>) => {
     const response = await fetch(url, {
@@ -103,18 +110,94 @@ export function useRecorder() {
     });
   }, []);
 
+  const clearTabShareResources = useCallback(() => {
+    if (removeTabEndedHandlerRef.current) {
+      removeTabEndedHandlerRef.current();
+      removeTabEndedHandlerRef.current = null;
+    }
+    if (tabVideoTrackRef.current) {
+      try {
+        tabVideoTrackRef.current.stop();
+      } catch {
+        // ignore
+      }
+      tabVideoTrackRef.current = null;
+    }
+    if (tabStreamRef.current) {
+      tabStreamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // ignore
+        }
+      });
+      tabStreamRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // ignore
+        }
+      });
+      micStreamRef.current = null;
+    }
+    if (combinedDestinationRef.current) {
+      try {
+        combinedDestinationRef.current.disconnect();
+      } catch {
+        // ignore
+      }
+      combinedDestinationRef.current = null;
+    }
+    if (audioContextRef.current) {
+      const ctx = audioContextRef.current;
+      audioContextRef.current = null;
+      void ctx.close().catch(() => {});
+    }
+  }, []);
+
+  const stopCaptureStreams = useCallback(() => {
+    if (trackCleanupRef.current) {
+      trackCleanupRef.current();
+      trackCleanupRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // ignore
+        }
+      });
+      streamRef.current = null;
+    }
+    clearTabShareResources();
+  }, [clearTabShareResources]);
+
   const resetMedia = useCallback(() => {
-    trackCleanupRef.current?.();
-    trackCleanupRef.current = null;
-    mediaRecorderRef.current?.stream.getTracks().forEach((track) => track.stop());
-    mediaRecorderRef.current?.stop();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    mediaRecorderRef.current = null;
-    streamRef.current = null;
+    const recorder = mediaRecorderRef.current;
+    if (recorder) {
+      try {
+        if (recorder.state !== "inactive") {
+          recorder.stop();
+        }
+      } catch (stopError) {
+        console.warn("Failed to stop recorder during reset", stopError);
+      }
+      try {
+        recorder.stream.getTracks().forEach((track) => track.stop());
+      } catch {
+        // ignore
+      }
+      mediaRecorderRef.current = null;
+    }
+    stopCaptureStreams();
     chunkQueueRef.current = [];
     uploadingRef.current = false;
     chunkCounterRef.current = 0;
-  }, []);
+  }, [stopCaptureStreams]);
 
   const disconnectSocket = useCallback(() => {
     socketRef.current?.removeAllListeners();
@@ -399,12 +482,7 @@ export function useRecorder() {
   const requestStream = useCallback(async () => {
     try {
       // Always clear any previous tracks to avoid "NotSupportedError" when restarting.
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
-        streamRef.current = null;
-      }
-      trackCleanupRef.current?.();
-      trackCleanupRef.current = null;
+      stopCaptureStreams();
 
       let stream: MediaStream;
       const trackTargets: { stream: MediaStream; label: string; endBehavior?: "stop" | "recover" }[] = [];
@@ -418,6 +496,7 @@ export function useRecorder() {
           video: true,
           preferCurrentTab: true,
         } as DisplayMediaStreamOptions);
+        tabStreamRef.current = tabStream;
 
         if (!tabStream.getAudioTracks().length) {
           tabStream.getTracks().forEach((track) => track.stop());
@@ -427,6 +506,7 @@ export function useRecorder() {
         }
 
         const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        micStreamRef.current = micStream;
         if (!micStream.getAudioTracks().length) {
           tabStream.getTracks().forEach((track) => track.stop());
           micStream.getTracks().forEach((track) => track.stop());
@@ -437,10 +517,26 @@ export function useRecorder() {
         const destination = audioContext.createMediaStreamDestination();
         audioContext.createMediaStreamSource(tabStream).connect(destination);
         audioContext.createMediaStreamSource(micStream).connect(destination);
+        audioContextRef.current = audioContext;
+        combinedDestinationRef.current = destination;
 
         const combinedStream = new MediaStream();
         destination.stream.getAudioTracks().forEach((track) => combinedStream.addTrack(track));
         stream = combinedStream;
+        const tabVideoTrack = tabStream.getVideoTracks()[0] ?? null;
+        if (tabVideoTrack) {
+          tabVideoTrackRef.current = tabVideoTrack;
+          const handleTabShareEnded = () => {
+            if (!isStoppingRef.current) {
+              void stopRecordingRef.current?.();
+            }
+          };
+          tabVideoTrack.addEventListener("ended", handleTabShareEnded);
+          removeTabEndedHandlerRef.current = () => {
+            tabVideoTrack.removeEventListener("ended", handleTabShareEnded);
+            removeTabEndedHandlerRef.current = null;
+          };
+        }
         trackTargets.push(
           { stream: combinedStream, label: "tab-mix", endBehavior: "recover" },
           { stream: tabStream, label: "tab-share", endBehavior: "stop" },
@@ -495,6 +591,13 @@ export function useRecorder() {
           if (muteTimeout !== null) {
             window.clearTimeout(muteTimeout);
             muteTimeout = null;
+          }
+          if (track.readyState !== "ended") {
+            try {
+              track.stop();
+            } catch {
+              // ignore
+            }
           }
         });
       };
@@ -566,6 +669,7 @@ export function useRecorder() {
       console.error(err);
       trackCleanupRef.current?.();
       trackCleanupRef.current = null;
+      clearTabShareResources();
       let message = err instanceof Error ? err.message : "Unable to access media devices";
       if (err instanceof DOMException) {
         if (err.name === "NotAllowedError" || err.name === "SecurityError" || err.name === "PermissionDeniedError") {
@@ -583,7 +687,7 @@ export function useRecorder() {
       setError(message);
       throw new Error(message);
     }
-  }, [handleData, selectedSource, send]);
+  }, [clearTabShareResources, handleData, selectedSource, send, stopCaptureStreams]);
 
   const createRecordingSession = useCallback(async () => {
     const response = await postJson<{ recording: { id: string }; token: string }>("/api/recordings", {
@@ -635,39 +739,50 @@ export function useRecorder() {
   }, [canUseSocket, clearSessionState, emitWithAck, ensureSocket, log, postJson, router]);
 
   const stopRecording = useCallback(async () => {
-    setSessionStatus("processing");
-    const recorder = mediaRecorderRef.current;
+    if (isStoppingRef.current) {
+      return;
+    }
+    isStoppingRef.current = true;
+    try {
+      setSessionStatus("processing");
+      const recorder = mediaRecorderRef.current;
 
-    if (recorder && recorder.state !== "inactive") {
-      finalChunkPromiseRef.current = new Promise<void>((resolve) => {
-        const handleFinalChunk = () => {
-          recorder.removeEventListener("dataavailable", handleFinalChunk as EventListener);
-          resolve();
-        };
-        recorder.addEventListener("dataavailable", handleFinalChunk as EventListener, { once: true });
-      });
+      if (recorder && recorder.state !== "inactive") {
+        finalChunkPromiseRef.current = new Promise<void>((resolve) => {
+          const handleFinalChunk = () => {
+            recorder.removeEventListener("dataavailable", handleFinalChunk as EventListener);
+            resolve();
+          };
+          recorder.addEventListener("dataavailable", handleFinalChunk as EventListener, { once: true });
+        });
 
-      try {
-        recorder.requestData();
-      } catch (requestError) {
-        console.warn("requestData failed", requestError);
+        try {
+          recorder.requestData();
+        } catch (requestError) {
+          console.warn("requestData failed", requestError);
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        recorder.stop();
+      } else {
+        flushRecorderBuffer();
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      recorder.stop();
-    } else {
-      flushRecorderBuffer();
-    }
+      stopCaptureStreams();
 
-    if (finalChunkPromiseRef.current) {
-      await finalChunkPromiseRef.current;
-      finalChunkPromiseRef.current = null;
+      if (finalChunkPromiseRef.current) {
+        await finalChunkPromiseRef.current;
+        finalChunkPromiseRef.current = null;
+      }
+      mediaRecorderRef.current = null;
+      send({ type: "STOP" });
+      log("Stopped recorder");
+      await flushQueue();
+      await completeSession();
+    } finally {
+      isStoppingRef.current = false;
     }
-    send({ type: "STOP" });
-    log("Stopped recorder");
-    await flushQueue();
-    await completeSession();
-  }, [completeSession, flushQueue, flushRecorderBuffer, log, send]);
+  }, [completeSession, flushQueue, flushRecorderBuffer, log, send, stopCaptureStreams]);
 
   useEffect(() => {
     stopRecordingRef.current = stopRecording;
