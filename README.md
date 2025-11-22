@@ -205,42 +205,6 @@ flowchart LR
         A["RecorderPanel + useRecorder"]
     end
 
-<<<<<<< HEAD
-    subgraph CAP[Capture Layer]
-        A1[getUserMedia / getDisplayMedia]
-        A2[MediaRecorder 30s chunks]
-        A3[Queue + Backpressure]
-    end
-
-    subgraph WS[Socket.io Client]
-        S1[emit: audio-chunk]
-        S2[on: chunk-transcribed]
-        S3[auto-reconnect fallback to REST]
-    end
-
-    subgraph REST[Next.js API Routes]
-        B1[POST /api/recordings]
-        B2[POST /api/recordings/:id/chunks]
-        B3[POST /api/recordings/:id/complete]
-    end
-
-    subgraph SOCKET_SERVER[Socket.io Relay]
-        R1[Validate token + rate-limit]
-        R2[Persist chunk -> Prisma]
-        R3[Call transcribeChunk]
-        R4[emit: chunk-transcribed]
-    end
-
-    subgraph DB[(Postgres)]
-        D1[recordingSession]
-        D2[audioChunk]
-        D3[transcript + summary]
-    end
-
-    subgraph GEMINI[Gemini API]
-        G1[Transcription]
-        G2[Summary]
-=======
     subgraph CAP["Capture Layer"]
         A1["getUserMedia / getDisplayMedia (mic or tab)"]
         A2["MediaRecorder (30s chunks)"]
@@ -275,7 +239,6 @@ flowchart LR
     subgraph GEMINI["Gemini API"]
         G1["Transcription"]
         G2["Summary"]
->>>>>>> 1e15fe12f1acee930147bd354e007fe3ee47251d
     end
 
     A --> A1 --> A2 --> A3
@@ -285,17 +248,11 @@ flowchart LR
     SOCKET_SERVER --> R3 --> G1
     R3 --> R4 --> S2 --> A
 
-<<<<<<< HEAD
-    A -->|create session| B1 --> DB
-    A -->|stop| B3 --> G2 --> DB
-    DB -->|UI updates| A
-    A -->|stop| B3 --> G2 --> DB
-=======
     A -->|Create session| B1 --> DB
     A -->|Stop| B3 --> G2 --> DB
 
     DB -->|UI Updates| A
->>>>>>> 1e15fe12f1acee930147bd354e007fe3ee47251d
+
 
 ```
 
