@@ -1,65 +1,95 @@
-import Image from "next/image";
+import { headers } from "next/headers";
+import { redirect } from "next/navigation";
+import { ArrowRight, Mic, Pause, Play, Waves } from "lucide-react";
 
-export default function Home() {
+import { auth } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+import { SignOutButton } from "@/components/auth/sign-out-button";
+import { RecorderPanel } from "@/components/recorder/recorder-panel";
+import { SessionHistory } from "@/components/recordings/session-history";
+
+const statusBadges = [
+  { label: "Recording", color: "text-emerald-400", icon: <Mic className="h-4 w-4" /> },
+  { label: "Paused", color: "text-amber-400", icon: <Pause className="h-4 w-4" /> },
+  { label: "Processing", color: "text-sky-400", icon: <Waves className="h-4 w-4" /> },
+  { label: "Completed", color: "text-purple-400", icon: <Play className="h-4 w-4" /> },
+];
+
+export default async function DashboardPage() {
+  const session = await auth.api.getSession({ headers: await headers() });
+
+  if (!session) {
+    redirect("/login");
+  }
+
+  const user = session.user;
+  const recordings = await prisma.recordingSession.findMany({
+    where: { userId: user.id },
+    select: {
+      id: true,
+      title: true,
+      status: true,
+      source: true,
+      startedAt: true,
+      completedAt: true,
+      summary: true,
+      transcript: true,
+      events: {
+        take: 1,
+        orderBy: { createdAt: "desc" },
+      },
+    },
+    orderBy: { startedAt: "desc" },
+    take: 30,
+  });
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
+    <main className="mx-auto flex min-h-screen w-full max-w-6xl flex-col gap-8 px-6 py-10">
+      <header className="flex flex-col gap-4 border border-slate-800/60 bg-slate-900/40 px-6 py-5 shadow-2xl shadow-slate-900/50 backdrop-blur lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <p className="text-sm text-slate-400">Welcome back</p>
+          <h1 className="text-3xl font-semibold text-white md:text-4xl">
+            {user.name ?? "ScribeAI Operator"}
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+          <p className="text-sm text-slate-500">{user.email}</p>
+        </div>
+        <div className="flex items-center gap-4">
+          <a
+            href="#recorder"
+            className="inline-flex items-center gap-2 rounded-full bg-emerald-500/90 px-5 py-2 text-sm font-semibold text-emerald-50 transition hover:bg-emerald-400"
+          >
+            Launch Recorder
+            <ArrowRight className="h-4 w-4" />
+          </a>
+          <SignOutButton />
+        </div>
+      </header>
+
+      <section className="grid gap-6 lg:grid-cols-3">
+        <div className="col-span-2 space-y-4 rounded-2xl border border-slate-800/60 bg-slate-900/30 p-6 shadow-inner shadow-slate-950" id="recorder">
+          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">Live pipeline</p>
+          <h2 className="text-2xl font-semibold text-white">Real-time transcription stream</h2>
+          <p className="text-sm text-slate-400">
+            Capture microphone or meeting tab audio, auto-chunk every 30 seconds, and persist it with incremental
+            Gemini transcripts. The queue + retry machine keeps uploads flowing even when the network hiccups.
           </p>
+          <div className="mt-6 flex flex-wrap gap-3 text-sm text-slate-400">
+            {statusBadges.map((badge) => (
+              <span
+                key={badge.label}
+                className="inline-flex items-center gap-2 rounded-full border border-slate-800/80 px-4 py-1.5"
+              >
+                <span className={badge.color}>{badge.icon}</span>
+                {badge.label}
+              </span>
+            ))}
+          </div>
+          <RecorderPanel />
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+        <SessionHistory recordings={recordings} />
+      </section>
+
+      
+    </main>
   );
 }
