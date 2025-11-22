@@ -200,57 +200,59 @@ This architecture map shows how all tiers interact during a recording.
 
 ```mermaid
 flowchart LR
-    subgraph UI[Browser UI]
-        A[RecorderPanel + useRecorder]
+
+    subgraph UI["Browser UI"]
+        A["RecorderPanel + useRecorder"]
     end
 
-    subgraph CAP[Capture Layer]
-        A1[getUserMedia / getDisplayMedia\n(mic or tab)]
-        A2[MediaRecorder\n30s chunks]
-        A3[Queue + Backpressure]
+    subgraph CAP["Capture Layer"]
+        A1["getUserMedia / getDisplayMedia (mic or tab)"]
+        A2["MediaRecorder (30s chunks)"]
+        A3["Queue + Backpressure Handler"]
     end
 
-    subgraph WS[Socket.io Client]
-        S1[[emit: audio-chunk]]
-        S2[[on: chunk-transcribed]]
-        S3[[auto-reconnect\nfallback to REST]]
+    subgraph WS["Socket.io Client"]
+        S1["emit: audio-chunk"]
+        S2["on: chunk-transcribed"]
+        S3["Auto-reconnect + REST fallback"]
     end
 
-    subgraph REST[Next.js API Routes]
-        B1[/POST /api/recordings]
-        B2[/POST /api/recordings/:id/chunks]
-        B3[/POST /api/recordings/:id/complete]
+    subgraph REST["Next.js API Routes"]
+        B1["POST /api/recordings"]
+        B2["POST /api/recordings/:id/chunks"]
+        B3["POST /api/recordings/:id/complete"]
     end
 
-    subgraph SOCKET_SERVER[Socket.io Relay (Node.js)]
-        R1[Validate token + rate-limit]
-        R2[Persist chunk → Prisma]
-        R3[Call transcribeChunk]
-        R4[emit: chunk-transcribed]
+    subgraph SOCKET_SERVER["Socket.io Relay (Node.js)"]
+        R1["Validate token + rate limit"]
+        R2["Persist chunk → Prisma"]
+        R3["Call transcribeChunk (Gemini)"]
+        R4["emit: chunk-transcribed"]
     end
 
-    subgraph DB[(Postgres)]
-        D1[(recordingSession)]
-        D2[(audioChunk)]
-        D3[(transcript + summary)]
+    subgraph DB["Postgres"]
+        D1["recordingSession table"]
+        D2["audioChunk table"]
+        D3["transcript + summary"]
     end
 
-    subgraph GEMINI[Gemini API]
-        G1[(Transcription)]
-        G2[(Summary)]
+    subgraph GEMINI["Gemini API"]
+        G1["Transcription"]
+        G2["Summary"]
     end
 
     A --> A1 --> A2 --> A3
-    A3 -->|preferred| S1 --> SOCKET_SERVER
-    A3 -->|fallback| B2 --> DB
+    A3 -->|Preferred path| S1 --> SOCKET_SERVER
+    A3 -->|REST fallback| B2 --> DB
 
     SOCKET_SERVER --> R3 --> G1
     R3 --> R4 --> S2 --> A
 
-    A -->|create session| B1 --> DB
-    A -->|stop| B3 --> G2 --> DB
+    A -->|Create session| B1 --> DB
+    A -->|Stop| B3 --> G2 --> DB
 
-    DB -->|UI updates| A
+    DB -->|UI Updates| A
+
 ```
 
 ## WebRTC vs. MediaRecorder
